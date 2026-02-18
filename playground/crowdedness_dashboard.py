@@ -151,15 +151,81 @@ def compute_crowdedness(df: pd.DataFrame, short_win: int = 20, long_win: int = 6
     sub["crowdedness"] = sub.mean(axis=1)
     sub["close"] = close.values
     sub["volume"] = volume.values
+    sub["ret"] = ret.values
     return sub
+
+
+def detect_sell_signals(
+    sub: pd.DataFrame,
+    crowd_threshold: int = 75,
+    rsi_period: int = 14,
+    lookback: int = 20,
+) -> pd.Series:
+    """
+    识别"坏的"拥挤度卖点信号。
+
+    卖点 = 高拥挤度 + 价格近期高位 + 至少一个衰竭确认:
+      1. 成交量 climax (Z-score > 2)
+      2. RSI 顶背离 (价格创新高但 RSI 未创新高)
+      3. 量价背离 (价格上涨但成交量趋势下降)
+
+    Returns
+    -------
+    bool Series, True 表示该日出现卖出信号
+    """
+    close = sub["close"]
+    volume = sub["volume"]
+    ret = sub["ret"]
+
+    # ---- RSI ----
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1 / rsi_period, min_periods=rsi_period).mean()
+    avg_loss = loss.ewm(alpha=1 / rsi_period, min_periods=rsi_period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+
+    # ---- 条件 1: 高拥挤度 ----
+    high_crowd = sub["crowdedness"] >= crowd_threshold
+
+    # ---- 条件 2: 价格接近近期高点 (在 lookback 日最高价的 95% 以上) ----
+    rolling_max = close.rolling(lookback, min_periods=1).max()
+    near_high = close >= rolling_max * 0.95
+
+    # ---- 衰竭确认 (至少满足 1 个) ----
+
+    # 2a. 成交量 climax: volume Z-score > 2
+    vol_ma = volume.rolling(lookback).mean()
+    vol_std = volume.rolling(lookback).std()
+    vol_zscore = (volume - vol_ma) / vol_std.replace(0, np.nan)
+    volume_climax = vol_zscore > 2
+
+    # 2b. RSI 顶背离: 价格创 lookback 日新高，但 RSI 低于其 lookback 日内最高值
+    price_at_high = close >= close.rolling(lookback, min_periods=1).max()
+    rsi_below_peak = rsi < rsi.rolling(lookback, min_periods=1).max() - 5
+    rsi_divergence = price_at_high & rsi_below_peak
+
+    # 2c. 量价背离: 近 lookback/2 日收益为正，但成交量呈下降趋势
+    half = max(lookback // 2, 5)
+    price_up = close.pct_change(half) > 0.02  # 价格上涨 >2%
+    vol_trend = volume.rolling(half).mean().pct_change(half)
+    vol_declining = vol_trend < -0.1  # 均量下降 >10%
+    pv_divergence = price_up & vol_declining
+
+    exhaustion = volume_climax | rsi_divergence | pv_divergence
+
+    sell_signal = high_crowd & near_high & exhaustion
+    return sell_signal.fillna(False)
 
 
 # ---------------------------------------------------------------------------
 # Plotly 绘图
 # ---------------------------------------------------------------------------
-def plot_all_crowdedness(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
-    """所有股票拥挤度时序对比折线图。"""
+def plot_all_crowdedness(crowd_dict: dict[str, pd.DataFrame], sell_dict: dict[str, pd.Series]) -> go.Figure:
+    """所有股票拥挤度时序对比折线图，红点标注卖出信号。"""
     fig = go.Figure()
+    first_sell = True  # 只在图例中显示一次"卖出信号"
     for i, tk in enumerate(crowd_dict):
         s = crowd_dict[tk]["crowdedness"].dropna()
         label = f"{tk} ({TICKER_NAMES[tk]})" if tk in TICKER_NAMES else tk
@@ -169,6 +235,20 @@ def plot_all_crowdedness(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
             line=dict(color=get_color(tk, i), width=2),
             hovertemplate=f"{tk}<br>日期: %{{x|%Y-%m-%d}}<br>拥挤度: %{{y:.1f}}<extra></extra>",
         ))
+        # 卖出信号红点
+        sell_mask = sell_dict[tk].reindex(s.index).fillna(False)
+        sell_pts = s[sell_mask]
+        if len(sell_pts) > 0:
+            fig.add_trace(go.Scatter(
+                x=sell_pts.index, y=sell_pts.values,
+                mode="markers",
+                name="卖出信号" if first_sell else None,
+                showlegend=first_sell,
+                marker=dict(color="red", size=9, symbol="circle",
+                            line=dict(color="darkred", width=1)),
+                hovertemplate=f"{tk} 卖出信号<br>日期: %{{x|%Y-%m-%d}}<br>拥挤度: %{{y:.1f}}<extra></extra>",
+            ))
+            first_sell = False
     fig.update_layout(
         title="交易拥挤度时序对比",
         xaxis_title="日期",
@@ -214,8 +294,8 @@ def plot_latest_ranking(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
-def plot_single_detail(tk: str, sub: pd.DataFrame, color_idx: int = 0) -> go.Figure:
-    """单只股票详情: 拥挤度 + 收盘价 + 成交量 三子图联动。"""
+def plot_single_detail(tk: str, sub: pd.DataFrame, sell_signal: pd.Series, color_idx: int = 0) -> go.Figure:
+    """单只股票详情: 拥挤度 + 收盘价 + 成交量 三子图联动，红点标注卖出信号。"""
     display_name = f"{tk} ({TICKER_NAMES[tk]})" if tk in TICKER_NAMES else tk
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
@@ -227,6 +307,7 @@ def plot_single_detail(tk: str, sub: pd.DataFrame, color_idx: int = 0) -> go.Fig
         row_heights=[0.4, 0.35, 0.25],
     )
     data = sub.dropna(subset=["crowdedness"])
+    sell_mask = sell_signal.reindex(data.index).fillna(False)
 
     # 拥挤度
     tk_color = get_color(tk, color_idx)
@@ -238,6 +319,17 @@ def plot_single_detail(tk: str, sub: pd.DataFrame, color_idx: int = 0) -> go.Fig
     ), row=1, col=1)
     fig.add_hline(y=80, line_dash="dash", line_color="red", opacity=0.4, row=1, col=1)
     fig.add_hline(y=20, line_dash="dash", line_color="green", opacity=0.4, row=1, col=1)
+
+    # 拥挤度面板上的卖出信号红点
+    sell_crowd = data.loc[sell_mask, "crowdedness"]
+    if len(sell_crowd) > 0:
+        fig.add_trace(go.Scatter(
+            x=sell_crowd.index, y=sell_crowd.values,
+            mode="markers", name="卖出信号",
+            marker=dict(color="red", size=10, symbol="circle",
+                        line=dict(color="darkred", width=1.5)),
+            hovertemplate="卖出信号<br>拥挤度: %{y:.1f}<extra></extra>",
+        ), row=1, col=1)
 
     # 子指标区域 (半透明)
     for col_name, label in [
@@ -261,6 +353,18 @@ def plot_single_detail(tk: str, sub: pd.DataFrame, color_idx: int = 0) -> go.Fig
         line=dict(color="#333", width=1.5),
         hovertemplate="价格: $%{y:.2f}<extra></extra>",
     ), row=2, col=1)
+
+    # 收盘价面板上的卖出信号红点
+    sell_price = data.loc[sell_mask, "close"]
+    if len(sell_price) > 0:
+        fig.add_trace(go.Scatter(
+            x=sell_price.index, y=sell_price.values,
+            mode="markers", name="卖出信号 (价格)",
+            marker=dict(color="red", size=10, symbol="triangle-down",
+                        line=dict(color="darkred", width=1.5)),
+            hovertemplate="卖出信号<br>价格: $%{y:.2f}<extra></extra>",
+            showlegend=False,
+        ), row=2, col=1)
 
     # 成交量
     fig.add_trace(go.Bar(
@@ -316,6 +420,10 @@ def main():
     short_win = st.sidebar.slider("短期窗口 (天)", 10, 40, 20)
     long_win = st.sidebar.slider("长期窗口 (天)", 40, 120, 60)
 
+    st.sidebar.header("卖出信号")
+    crowd_threshold = st.sidebar.slider("拥挤度阈值", 50, 95, 75,
+                                        help="拥挤度超过此值才可能触发卖出信号")
+
     # 拉取数据
     data_dict = fetch_data(tickers, str(start_date), str(end_date))
     if not data_dict:
@@ -333,13 +441,15 @@ def main():
         format_func=lambda t: f"{t} ({TICKER_NAMES[t]})" if t in TICKER_NAMES else t,
     )
 
-    # 计算拥挤度
+    # 计算拥挤度 + 卖出信号
     crowd_dict: dict[str, pd.DataFrame] = {}
+    sell_dict: dict[str, pd.Series] = {}
     for tk in valid_tickers:
         crowd_dict[tk] = compute_crowdedness(data_dict[tk], short_win, long_win)
+        sell_dict[tk] = detect_sell_signals(crowd_dict[tk], crowd_threshold, lookback=short_win)
 
     # 全局对比
-    st.plotly_chart(plot_all_crowdedness(crowd_dict), use_container_width=True)
+    st.plotly_chart(plot_all_crowdedness(crowd_dict, sell_dict), use_container_width=True)
 
     # 排名
     st.plotly_chart(plot_latest_ranking(crowd_dict), use_container_width=True)
@@ -348,7 +458,7 @@ def main():
     display_name = f"{selected} ({TICKER_NAMES[selected]})" if selected in TICKER_NAMES else selected
     st.subheader(f"{display_name} 详细分析")
     color_idx = valid_tickers.index(selected)
-    st.plotly_chart(plot_single_detail(selected, crowd_dict[selected], color_idx), use_container_width=True)
+    st.plotly_chart(plot_single_detail(selected, crowd_dict[selected], sell_dict[selected], color_idx), use_container_width=True)
 
     # 指标说明
     with st.expander("指标说明"):
@@ -365,6 +475,19 @@ def main():
 
 - **拥挤度 > 80**: 交易过度集中，注意风险
 - **拥挤度 < 20**: 交易清淡，可能存在机会
+
+---
+
+**卖出信号 (红点)** 区分"好的拥挤"与"坏的拥挤"，仅在同时满足以下条件时触发:
+
+1. **高拥挤度**: 合成拥挤度 >= 阈值 (侧边栏可调)
+2. **价格近期高位**: 收盘价位于滚动最高价的 95% 以上
+3. **至少一个衰竭确认**:
+   - 成交量 Climax: 成交量 Z-score > 2 (相对滚动均值的极端放量)
+   - RSI 顶背离: 价格创新高但 RSI 未同步创新高 (动量衰减)
+   - 量价背离: 价格上涨但成交量趋势下降 (买盘枯竭)
+
+> "好的拥挤"(健康突破、持续放量) 不会触发卖出信号，只有出现衰竭特征的"坏的拥挤"才会标记。
 """)
 
 
