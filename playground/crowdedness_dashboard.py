@@ -17,6 +17,8 @@
 运行: streamlit run crowdedness_dashboard.py
 """
 
+from datetime import date, timedelta
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,7 +29,7 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
-TICKERS = ["NVDA", "META", "GOOGL", "MSFT", "TSLA", "AAPL", "AMZN"]
+DEFAULT_TICKERS = ["NVDA", "META", "GOOGL", "MSFT", "TSLA", "AAPL", "AMZN"]
 
 TICKER_NAMES = {
     "NVDA": "NVIDIA",
@@ -39,7 +41,7 @@ TICKER_NAMES = {
     "AMZN": "Amazon",
 }
 
-COLORS = {
+DEFAULT_COLORS = {
     "NVDA": "#76B900",
     "META": "#0081FB",
     "GOOGL": "#EA4335",
@@ -49,19 +51,38 @@ COLORS = {
     "AMZN": "#FF9900",
 }
 
+# Plotly 默认调色板，用于为用户自定义的股票分配颜色
+_PALETTE = [
+    "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+    "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+]
+
+
+def get_color(ticker: str, idx: int) -> str:
+    """返回 ticker 对应的颜色，优先使用预设颜色，否则从调色板分配。"""
+    return DEFAULT_COLORS.get(ticker, _PALETTE[idx % len(_PALETTE)])
+
 
 # ---------------------------------------------------------------------------
 # 数据获取
 # ---------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="正在从 Yahoo Finance 拉取数据 ...")
-def fetch_data() -> dict[str, pd.DataFrame]:
-    """为每只股票拉取过去 1 年日线 OHLCV 数据，返回 {ticker: DataFrame}。"""
-    raw = yf.download(TICKERS, period="1y", interval="1d", group_by="ticker", progress=False)
-    result = {}
-    for tk in TICKERS:
-        df = raw[tk].dropna()
+def fetch_data(tickers: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
+    """拉取指定股票在 [start, end] 区间的日线 OHLCV 数据，返回 {ticker: DataFrame}。"""
+    if len(tickers) == 1:
+        raw = yf.download(tickers, start=start, end=end, interval="1d", progress=False)
+        df = raw.dropna()
         df.columns = [c if isinstance(c, str) else c[0] for c in df.columns]
-        result[tk] = df
+        return {tickers[0]: df}
+    raw = yf.download(tickers, start=start, end=end, interval="1d", group_by="ticker", progress=False)
+    result = {}
+    for tk in tickers:
+        try:
+            df = raw[tk].dropna()
+            df.columns = [c if isinstance(c, str) else c[0] for c in df.columns]
+            result[tk] = df
+        except KeyError:
+            pass
     return result
 
 
@@ -137,14 +158,15 @@ def compute_crowdedness(df: pd.DataFrame, short_win: int = 20, long_win: int = 6
 # Plotly 绘图
 # ---------------------------------------------------------------------------
 def plot_all_crowdedness(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
-    """7 只股票拥挤度时序对比折线图。"""
+    """所有股票拥挤度时序对比折线图。"""
     fig = go.Figure()
-    for tk in TICKERS:
+    for i, tk in enumerate(crowd_dict):
         s = crowd_dict[tk]["crowdedness"].dropna()
+        label = f"{tk} ({TICKER_NAMES[tk]})" if tk in TICKER_NAMES else tk
         fig.add_trace(go.Scatter(
             x=s.index, y=s.values,
-            mode="lines", name=f"{tk} ({TICKER_NAMES[tk]})",
-            line=dict(color=COLORS[tk], width=2),
+            mode="lines", name=label,
+            line=dict(color=get_color(tk, i), width=2),
             hovertemplate=f"{tk}<br>日期: %{{x|%Y-%m-%d}}<br>拥挤度: %{{y:.1f}}<extra></extra>",
         ))
     fig.update_layout(
@@ -166,15 +188,16 @@ def plot_all_crowdedness(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
 def plot_latest_ranking(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
     """最新拥挤度排名柱状图。"""
     latest = {}
-    for tk in TICKERS:
+    for tk in crowd_dict:
         s = crowd_dict[tk]["crowdedness"].dropna()
         if len(s) > 0:
             latest[tk] = s.iloc[-1]
     sorted_items = sorted(latest.items(), key=lambda x: x[1], reverse=True)
     tickers = [t for t, _ in sorted_items]
     values = [v for _, v in sorted_items]
-    colors = [COLORS[t] for t in tickers]
-    labels = [f"{t} ({TICKER_NAMES[t]})" for t in tickers]
+    all_tks = list(crowd_dict.keys())
+    colors = [get_color(t, all_tks.index(t)) for t in tickers]
+    labels = [f"{t} ({TICKER_NAMES[t]})" if t in TICKER_NAMES else t for t in tickers]
 
     fig = go.Figure(go.Bar(
         x=labels, y=values, marker_color=colors,
@@ -191,12 +214,13 @@ def plot_latest_ranking(crowd_dict: dict[str, pd.DataFrame]) -> go.Figure:
     return fig
 
 
-def plot_single_detail(tk: str, sub: pd.DataFrame) -> go.Figure:
+def plot_single_detail(tk: str, sub: pd.DataFrame, color_idx: int = 0) -> go.Figure:
     """单只股票详情: 拥挤度 + 收盘价 + 成交量 三子图联动。"""
+    display_name = f"{tk} ({TICKER_NAMES[tk]})" if tk in TICKER_NAMES else tk
     fig = make_subplots(
         rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         subplot_titles=(
-            f"{tk} ({TICKER_NAMES[tk]}) 拥挤度",
+            f"{display_name} 拥挤度",
             "收盘价",
             "成交量",
         ),
@@ -205,10 +229,11 @@ def plot_single_detail(tk: str, sub: pd.DataFrame) -> go.Figure:
     data = sub.dropna(subset=["crowdedness"])
 
     # 拥挤度
+    tk_color = get_color(tk, color_idx)
     fig.add_trace(go.Scatter(
         x=data.index, y=data["crowdedness"],
         mode="lines", name="拥挤度",
-        line=dict(color=COLORS[tk], width=2),
+        line=dict(color=tk_color, width=2),
         hovertemplate="拥挤度: %{y:.1f}<extra></extra>",
     ), row=1, col=1)
     fig.add_hline(y=80, line_dash="dash", line_color="red", opacity=0.4, row=1, col=1)
@@ -240,7 +265,7 @@ def plot_single_detail(tk: str, sub: pd.DataFrame) -> go.Figure:
     # 成交量
     fig.add_trace(go.Bar(
         x=data.index, y=data["volume"],
-        name="成交量", marker_color=COLORS[tk], opacity=0.6,
+        name="成交量", marker_color=tk_color, opacity=0.6,
         hovertemplate="成交量: %{y:,.0f}<extra></extra>",
     ), row=3, col=1)
 
@@ -264,22 +289,53 @@ def main():
     st.title("交易拥挤度 Dashboard")
     st.caption("数据来源: Yahoo Finance | 指标: 5 维度合成拥挤度")
 
-    # 侧边栏参数
+    # ---- 侧边栏 ----
+    st.sidebar.header("股票选择")
+    ticker_input = st.sidebar.text_input(
+        "股票代码 (逗号分隔)",
+        value=", ".join(DEFAULT_TICKERS),
+        help="输入 Yahoo Finance 股票代码，用逗号分隔，例如: NVDA, AAPL, 005930.KS",
+    )
+    # 解析用户输入的 ticker
+    tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
+    if not tickers:
+        st.error("请输入至少一个股票代码")
+        return
+
+    st.sidebar.header("日期范围")
+    default_end = date.today()
+    default_start = default_end - timedelta(days=365)
+    col_start, col_end = st.sidebar.columns(2)
+    start_date = col_start.date_input("开始日期", value=default_start)
+    end_date = col_end.date_input("结束日期", value=default_end)
+    if start_date >= end_date:
+        st.error("开始日期必须早于结束日期")
+        return
+
     st.sidebar.header("参数设置")
     short_win = st.sidebar.slider("短期窗口 (天)", 10, 40, 20)
     long_win = st.sidebar.slider("长期窗口 (天)", 40, 120, 60)
-    selected = st.sidebar.selectbox(
-        "单只股票详情",
-        TICKERS,
-        format_func=lambda t: f"{t} ({TICKER_NAMES[t]})",
-    )
 
     # 拉取数据
-    data_dict = fetch_data()
+    data_dict = fetch_data(tickers, str(start_date), str(end_date))
+    if not data_dict:
+        st.error("未能获取任何股票数据，请检查代码是否正确")
+        return
+
+    # 过滤掉拉取失败的 ticker
+    valid_tickers = list(data_dict.keys())
+
+    # 单只详情选择器 (放在数据加载后，只显示有效 ticker)
+    st.sidebar.header("详情查看")
+    selected = st.sidebar.selectbox(
+        "单只股票详情",
+        valid_tickers,
+        format_func=lambda t: f"{t} ({TICKER_NAMES[t]})" if t in TICKER_NAMES else t,
+    )
 
     # 计算拥挤度
     crowd_dict: dict[str, pd.DataFrame] = {}
-    for tk in TICKERS:
+    for tk in valid_tickers:
         crowd_dict[tk] = compute_crowdedness(data_dict[tk], short_win, long_win)
 
     # 全局对比
@@ -289,8 +345,10 @@ def main():
     st.plotly_chart(plot_latest_ranking(crowd_dict), use_container_width=True)
 
     # 单只详情
-    st.subheader(f"{selected} ({TICKER_NAMES[selected]}) 详细分析")
-    st.plotly_chart(plot_single_detail(selected, crowd_dict[selected]), use_container_width=True)
+    display_name = f"{selected} ({TICKER_NAMES[selected]})" if selected in TICKER_NAMES else selected
+    st.subheader(f"{display_name} 详细分析")
+    color_idx = valid_tickers.index(selected)
+    st.plotly_chart(plot_single_detail(selected, crowd_dict[selected], color_idx), use_container_width=True)
 
     # 指标说明
     with st.expander("指标说明"):
