@@ -9,7 +9,7 @@
 交易拥挤度由 5 个子指标等权合成，每个子指标先做滚动百分位归一化 (0-100):
 
 1. 成交量激增比  Volume / MA(Volume, short_window)
-2. 波动率压缩比  RealizedVol(5d) / RealizedVol(long_window)
+2. 波动率扩张比  RealizedVol(5d) / RealizedVol(long_window)
 3. 量价相关性    RollingCorr(|Return|, Volume, short_window)
 4. 收益自相关    RollingAutoCorr(Return, short_window)
 5. 换手集中度    RollingStd(Volume / MA(Volume, long_window), short_window)
@@ -70,11 +70,11 @@ def get_color(ticker: str, idx: int) -> str:
 def fetch_data(tickers: list[str], start: str, end: str) -> dict[str, pd.DataFrame]:
     """拉取指定股票在 [start, end] 区间的日线 OHLCV 数据，返回 {ticker: DataFrame}。"""
     if len(tickers) == 1:
-        raw = yf.download(tickers, start=start, end=end, interval="1d", progress=False)
+        raw = yf.download(tickers, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
         df = raw.dropna()
         df.columns = [c if isinstance(c, str) else c[0] for c in df.columns]
         return {tickers[0]: df}
-    raw = yf.download(tickers, start=start, end=end, interval="1d", group_by="ticker", progress=False)
+    raw = yf.download(tickers, start=start, end=end, interval="1d", group_by="ticker", auto_adjust=True, progress=False)
     result = {}
     for tk in tickers:
         try:
@@ -119,17 +119,18 @@ def compute_crowdedness(df: pd.DataFrame, short_win: int = 20, long_win: int = 6
     # 1. 成交量激增比
     vol_surge = volume / volume.rolling(short_win).mean()
 
-    # 2. 波动率压缩比
+    # 2. 波动率扩张比
     vol_short = ret.rolling(5).std() * np.sqrt(252)
     vol_long = ret.rolling(long_win).std() * np.sqrt(252)
-    vol_ratio = vol_short / vol_long
+    vol_expansion = vol_short / vol_long
 
     # 3. 量价相关性
     abs_ret = ret.abs()
     pv_corr = abs_ret.rolling(short_win).corr(volume)
 
     # 4. 收益自相关
-    ret_autocorr = ret.rolling(short_win).apply(
+    autocorr_win = max(short_win * 2, 40)
+    ret_autocorr = ret.rolling(autocorr_win).apply(
         lambda x: pd.Series(x).autocorr(lag=1) if len(x) >= 2 else np.nan,
         raw=False,
     )
@@ -139,10 +140,10 @@ def compute_crowdedness(df: pd.DataFrame, short_win: int = 20, long_win: int = 6
     turnover_conc = turnover_ratio.rolling(short_win).std()
 
     # 百分位归一化 (使用 long_win 做历史参考窗口)
-    rank_win = long_win
+    rank_win = min(252, max(long_win, len(df) - long_win))
     sub = pd.DataFrame({
         "vol_surge": rolling_percentile(vol_surge, rank_win),
-        "vol_ratio": rolling_percentile(vol_ratio, rank_win),
+        "vol_expansion": rolling_percentile(vol_expansion, rank_win),
         "pv_corr": rolling_percentile(pv_corr, rank_win),
         "ret_autocorr": rolling_percentile(ret_autocorr, rank_win),
         "turnover_conc": rolling_percentile(turnover_conc, rank_win),
@@ -201,16 +202,17 @@ def detect_sell_signals(
     vol_zscore = (volume - vol_ma) / vol_std.replace(0, np.nan)
     volume_climax = vol_zscore > 2
 
-    # 2b. RSI 顶背离: 价格创 lookback 日新高，但 RSI 低于其 lookback 日内最高值
+    # 2b. RSI 顶背离: 价格创 lookback 日新高，但 RSI 较前期明显衰减
     price_at_high = close >= close.rolling(lookback, min_periods=1).max()
-    rsi_below_peak = rsi < rsi.rolling(lookback, min_periods=1).max() - 5
-    rsi_divergence = price_at_high & rsi_below_peak
+    rsi_momentum_decay = rsi < rsi.shift(lookback // 2).rolling(5).mean() - 5
+    rsi_divergence = price_at_high & rsi_momentum_decay & (rsi > 60)
 
-    # 2c. 量价背离: 近 lookback/2 日收益为正，但成交量呈下降趋势
+    # 2c. 量价背离: 近 lookback/2 日收益为正，但均量趋势下降
     half = max(lookback // 2, 5)
     price_up = close.pct_change(half) > 0.02  # 价格上涨 >2%
-    vol_trend = volume.rolling(half).mean().pct_change(half)
-    vol_declining = vol_trend < -0.1  # 均量下降 >10%
+    vol_recent_avg = volume.rolling(half).mean()
+    vol_prior_avg = vol_recent_avg.shift(half)
+    vol_declining = (vol_recent_avg / vol_prior_avg - 1) < -0.1  # 均量下降 >10%
     pv_divergence = price_up & vol_declining
 
     exhaustion = volume_climax | rsi_divergence | pv_divergence
@@ -334,7 +336,7 @@ def plot_single_detail(tk: str, sub: pd.DataFrame, sell_signal: pd.Series, color
     # 子指标区域 (半透明)
     for col_name, label in [
         ("vol_surge", "成交量激增"),
-        ("vol_ratio", "波动率压缩"),
+        ("vol_expansion", "波动率扩张"),
         ("pv_corr", "量价相关"),
         ("ret_autocorr", "收益自相关"),
         ("turnover_conc", "换手集中"),
@@ -468,7 +470,7 @@ def main():
 | 子指标 | 公式 | 含义 |
 |--------|------|------|
 | 成交量激增比 | Volume / MA(Volume, 短期窗口) | 短期放量程度 |
-| 波动率压缩比 | RealizedVol(5d) / RealizedVol(长期窗口) | 短期波动相对长期的偏离 |
+| 波动率扩张比 | RealizedVol(5d) / RealizedVol(长期窗口) | 短期波动相对长期的偏离 |
 | 量价相关性 | RollingCorr(\\|Return\\|, Volume, 短期窗口) | 价格与成交量的同步性 |
 | 收益自相关 | AutoCorr(Return, lag=1, 短期窗口) | 动量追逐 / 趋势拥挤 |
 | 换手集中度 | RollingStd(Volume / MA(Volume, 长期窗口), 短期窗口) | 成交量分布的集中程度 |
